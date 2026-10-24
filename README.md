@@ -1,8 +1,6 @@
-# Short_NURL_Two
+# Short_NURL_PHP_2
 Personal short URL service | 个人短链服务
 
 ---
 
-欢迎使用全新一代 short URL 短链服务。
-
-即将推出！
+受到 CVE-2026-109618 & CVE-2026-109619 影响，本仓库关闭。
