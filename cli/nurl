@@ -1,0 +1,329 @@
+#!/usr/bin/env php
+<?php
+/**
+ * nurl — Short_NURL 本地管理工具 v2.0
+ *
+ * 用法：php cli/nurl <标志>
+ *
+ * 标志：
+ *   -new          生成常驻密钥 + 补充一次性密钥池
+ *   -long         仅轮换常驻密钥
+ *   -full         仅补充一次性密钥池
+ *   -svc          生成服务密钥（永不过期，用于服务间集成）
+ *   -svc -label:X 指定服务密钥标签（默认 default）
+ *   -itk          生成/轮换内部通信令牌（LPA-Key）
+ *   -look         显示密钥状态（不显示明文）
+ *   -drop         撤销所有密钥（含内部令牌）
+ *   -drop -long   仅删除常驻密钥
+ *   -drop -full   仅删除所有一次性密钥
+ *   -drop -svc    仅删除服务密钥
+ *   -drop -itk    仅删除内部通信令牌
+ *   -sweep        清理过期临时短链
+ *   -v            查看版本
+ *   -h / -help    显示帮助信息
+ *
+ * 所有操作均为纯本地文件读写，不依赖网络。
+ * 短链远程操作请使用：php cli/nurl-key
+ */
+
+// ── 初始化 ───────────────────────────────────────────────
+if (PHP_SAPI !== 'cli') {
+    fwrite(STDERR, "错误：此脚本必须从命令行运行。\n");
+    exit(1);
+}
+
+define('NURL_VERSION', '2.0.3');
+
+$cliCustomVersion = <<<VERSION
+Short_NURL v2.0.3-pre
+---------------------------
+GitHub：https://github.com/UeCook/Short_NURL
+VERSION;
+
+// 加载核心层
+require_once __DIR__ . '/../core/src/autoload.php';
+
+use ShortURL\Core\KeyStore;
+use ShortURL\Core\JsonStore;
+use function ShortURL\Core\cleanExpiredEntries;
+
+set_exception_handler(function (Throwable $e): void {
+    fwrite(STDERR, '错误：' . $e->getMessage() . "\n");
+    exit(1);
+});
+
+$configPath = __DIR__ . '/../core/config.php';
+if (!file_exists($configPath)) {
+    fwrite(STDERR, "错误：在 $configPath 未找到 config.php\n");
+    exit(1);
+}
+
+$cfg = require $configPath;
+
+$keyStore = new KeyStore(
+    $cfg['keys_path'],
+    $cfg['tz_offset'],
+    $cfg['key_ttl_days'],
+    $cfg['onetime_pool_size']
+);
+
+$internalTokenPath = $cfg['internal_token_path'];
+
+// ── 解析参数 ─────────────────────────────────────────────
+$args = array_slice($argv, 1);
+
+if (empty($args)) {
+    showHelp();
+    exit(0);
+}
+
+$hasNew  = in_array('-new', $args);
+$hasLong = in_array('-long', $args);
+$hasFull = in_array('-full', $args);
+$hasSvc  = in_array('-svc', $args);
+$hasItk  = in_array('-itk', $args);
+$hasLook = in_array('-look', $args);
+$hasDrop = in_array('-drop', $args);
+$hasSweep = in_array('-sweep', $args);
+$hasV    = in_array('-v', $args);
+$hasH    = in_array('-h', $args) || in_array('-help', $args);
+
+// ── 路由命令 ─────────────────────────────────────────────
+
+if ($hasH) {
+    showHelp();
+    exit(0);
+}
+
+if ($hasV) {
+    echo ($cliCustomVersion !== '' ? $cliCustomVersion : "nurl v" . NURL_VERSION) . "\n";
+    exit(0);
+}
+
+if ($hasSweep) {
+    doSweep($cfg);
+    exit(0);
+}
+
+if ($hasDrop) {
+    $dropTargets = array_filter([$hasLong, $hasFull, $hasSvc, $hasItk]);
+    if (count($dropTargets) > 1) {
+        fwrite(STDERR, "错误：-drop 一次只能指定一个目标。\n");
+        exit(1);
+    }
+    if ($hasLong) {
+        $keyStore->revoke('resident');
+        echo "常驻密钥已撤销。\n";
+    } elseif ($hasFull) {
+        $keyStore->revoke('onetime');
+        echo "一次性密钥池已清空。\n";
+    } elseif ($hasSvc) {
+        $keyStore->revoke('service');
+        echo "服务密钥已撤销。\n";
+    } elseif ($hasItk) {
+        if (file_exists($internalTokenPath)) {
+            if (!unlink($internalTokenPath)) {
+                throw new RuntimeException("无法删除内部通信令牌: {$internalTokenPath}");
+            }
+            echo "内部通信令牌已删除。\n";
+        } else {
+            echo "内部通信令牌不存在。\n";
+        }
+    } else {
+        $keyStore->revoke('all');
+        if (file_exists($internalTokenPath)) {
+            if (!unlink($internalTokenPath)) {
+                throw new RuntimeException("无法删除内部通信令牌: {$internalTokenPath}");
+            }
+        }
+        echo "所有密钥和内部通信令牌已撤销。\n";
+    }
+    exit(0);
+}
+
+// 保持 v1 优先级：drop > svc > itk > look > new/long/full。
+if ($hasSvc) {
+    $label = 'default';
+    foreach ($args as $arg) {
+        if (strpos($arg, '-label:') === 0) {
+            $label = substr($arg, 7);
+            break;
+        }
+    }
+    try {
+        $serviceKey = $keyStore->generateService($label);
+    } catch (RuntimeException $e) {
+        fwrite(STDERR, '错误：' . $e->getMessage() . "\n请先使用 php cli/nurl -drop -svc 撤销旧密钥。\n");
+        exit(1);
+    }
+    echo "新服务密钥：{$serviceKey}\n标签：{$label}\n";
+    exit(0);
+}
+
+if ($hasItk) {
+    $token = bin2hex(random_bytes(32));
+    writeInternalToken($internalTokenPath, $token);
+    echo "新内部通信令牌：{$token}\n";
+    exit(0);
+}
+
+if ($hasLook) {
+    $status = $keyStore->status();
+    echo "密钥状态：\n";
+    echo "────────────────────────────────────────\n";
+    echo "常驻密钥：\n";
+    if ($status['resident']) {
+        echo "  前缀：{$status['resident']['prefix']}\n";
+        echo "  创建：{$status['resident']['created']}\n";
+        echo "  过期：{$status['resident']['expires']}\n";
+    } else {
+        echo "  （未设置）\n";
+    }
+    echo "────────────────────────────────────────\n";
+    echo "服务密钥：\n";
+    if ($status['service']) {
+        echo "  前缀：{$status['service']['prefix']}\n";
+        echo "  创建：{$status['service']['created']}\n";
+        echo "  标签：{$status['service']['label']}\n";
+    } else {
+        echo "  （未设置）\n";
+    }
+    echo "────────────────────────────────────────\n";
+    echo "一次性密钥池：{$status['onetime_count']}/{$status['onetime_pool_size']} 可用\n";
+    foreach ($status['onetime_pool'] as $i => $slot) {
+        $state = $slot['consumed'] ? '已消耗' : (!empty($slot['reserved']) ? '预约中' : '可用');
+        echo "  [{$i}] {$slot['prefix']} ({$state})\n";
+    }
+    echo "预约中：{$status['onetime_reserved_count']}\n";
+    $tokenRaw = @file_get_contents($internalTokenPath);
+    $token = $tokenRaw === false ? '' : trim($tokenRaw);
+    echo '内部通信令牌（LPA-Key）：' . ($token === '' ? '（未设置）' : substr($token, 0, 8) . '...（已设置）') . "\n";
+    exit(0);
+}
+
+if ($hasLong && $hasFull) {
+    fwrite(STDERR, "错误：-long 和 -full 不能同时使用。\n");
+    exit(1);
+}
+
+if ($hasNew) {
+    $residentKey = $hasFull ? null : $keyStore->generateResident();
+    $onetimeKeys = $hasLong ? [] : $keyStore->fillPool();
+    $existingToken = @file_get_contents($internalTokenPath);
+    $newInternalToken = null;
+    if (!$hasLong && !$hasFull && ($existingToken === false || trim($existingToken) === '')) {
+        $newInternalToken = bin2hex(random_bytes(32));
+        writeInternalToken($internalTokenPath, $newInternalToken);
+    }
+    if ($residentKey !== null) echo "新常驻密钥：{$residentKey}\n";
+    if (!empty($onetimeKeys)) {
+        echo "新一次性密钥：\n";
+        foreach ($onetimeKeys as $i => $key) {
+            echo "  [{$i}] {$key}\n";
+        }
+    }
+    if ($newInternalToken !== null) {
+        echo "新内部通信令牌：{$newInternalToken}\n";
+    }
+    exit(0);
+}
+
+if ($hasLong) {
+    $residentKey = $keyStore->generateResident();
+    echo "新常驻密钥：{$residentKey}\n";
+    exit(0);
+}
+
+if ($hasFull) {
+    $onetimeKeys = $keyStore->fillPool();
+    if (!empty($onetimeKeys)) {
+        echo "新一次性密钥：\n";
+        foreach ($onetimeKeys as $i => $key) {
+            echo "  [{$i}] {$key}\n";
+        }
+    } else {
+        echo "一次性密钥池已满。\n";
+    }
+    exit(0);
+}
+
+echo "未知命令。使用 -h 查看帮助。\n";
+exit(1);
+
+// ── 函数 ─────────────────────────────────────────────────
+
+function showHelp(): void
+{
+    echo <<<HELP
+nurl — Short_NURL 本地管理工具 v2.0
+
+用法：php cli/nurl <标志>
+
+标志：
+  -new          生成常驻密钥 + 补充一次性密钥池
+  -new -long    仅轮换常驻密钥
+  -new -full    仅补充一次性密钥池
+  -long         仅轮换常驻密钥
+  -full         仅补充一次性密钥池
+  -svc          生成服务密钥（永不过期，用于服务间集成）
+  -svc -label:X 指定服务密钥标签（默认 default）
+  -itk          生成/轮换内部通信令牌（LPA-Key）
+  -look         显示密钥状态（不显示明文）
+  -drop         撤销所有密钥（含内部令牌）
+  -drop -long   仅删除常驻密钥
+  -drop -full   仅删除所有一次性密钥
+  -drop -svc    仅删除服务密钥
+  -drop -itk    仅删除内部通信令牌
+  -sweep        清理过期临时短链
+  -v            查看版本
+  -h / -help    显示帮助信息
+
+所有操作均为纯本地文件读写，不依赖网络。
+短链远程操作请使用：php cli/nurl-key
+HELP;
+}
+
+function doSweep(array $cfg): void
+{
+    $tempPath = $cfg['temp_path'];
+    if (!file_exists($tempPath)) {
+        echo "临时存储文件不存在。\n";
+        return;
+    }
+
+    $tempStore = new JsonStore($tempPath, $cfg['tz_offset']);
+    $tempStore->lockBegin();
+    try {
+        $data = $tempStore->readLocked();
+        $before = count($data);
+        cleanExpiredEntries($data);
+        $after = count($data);
+        $removed = $before - $after;
+        if ($removed > 0) {
+            $tempStore->writeLocked($data);
+            echo "已清理 {$removed} 条过期临时短链。\n";
+        } else {
+            echo "没有过期的临时短链。\n";
+        }
+    } finally {
+        $tempStore->lockEnd();
+    }
+}
+
+function writeInternalToken(string $path, string $token): void
+{
+    $dir = dirname($path);
+    if (!is_dir($dir) && !mkdir($dir, 0755, true)) {
+        throw new RuntimeException("无法创建目录: {$dir}");
+    }
+    $tmp = $path . '.tmp.' . bin2hex(random_bytes(6));
+    if (file_put_contents($tmp, $token, LOCK_EX) === false) {
+        @unlink($tmp);
+        throw new RuntimeException("无法写入内部通信令牌: {$tmp}");
+    }
+    @chmod($tmp, 0600);
+    if (!rename($tmp, $path)) {
+        @unlink($tmp);
+        throw new RuntimeException("无法替换内部通信令牌: {$path}");
+    }
+}

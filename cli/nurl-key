@@ -1,0 +1,354 @@
+#!/usr/bin/env php
+<?php
+/**
+ * nurl-key — Short_NURL 远程短链管理工具 v2.0
+ *
+ * 通过无头 API（headless）远程管理短链，需要网络连接。
+ * 认证方式：X-Headless-Token 请求头
+ *
+ * 用法：php cli/nurl-key -key "su_xxx" <操作> [参数]
+ *
+ * 操作：
+ *   -list                    查看所有短链
+ *   -stat                    查看配额状态
+ *   -get "code"              查看单条短链
+ *   -add -url "https://..." -ttl 0 [-code "abc"]
+ *                            创建短链（-code 可选，不填自动生成）
+ *   -rm -code "abc"          删除短链
+ *   -h / -help               显示帮助信息
+ *   -v                       查看版本
+ */
+
+// ── 初始化 ───────────────────────────────────────────────
+if (PHP_SAPI !== 'cli') {
+    fwrite(STDERR, "错误：此脚本必须从命令行运行。\n");
+    exit(1);
+}
+
+define('NURL_KEY_VERSION', '2.0.3');
+
+$configPath = __DIR__ . '/../core/config.php';
+if (!file_exists($configPath)) {
+    fwrite(STDERR, "错误：在 $configPath 未找到 config.php\n");
+    exit(1);
+}
+$cfg = require $configPath;
+$domain = $cfg['domain'];
+
+// ── 解析参数 ─────────────────────────────────────────────
+$args = array_slice($argv, 1);
+
+if (empty($args)) {
+    showHelp();
+    exit(0);
+}
+
+$hasH    = in_array('-h', $args) || in_array('-help', $args);
+$hasV    = in_array('-v', $args);
+$hasList = in_array('-list', $args);
+$hasStat = in_array('-stat', $args);
+$hasGet  = in_array('-get', $args) || count(array_filter($args, fn($arg) => str_starts_with($arg, '-get:'))) > 0;
+$hasAdd  = in_array('-add', $args);
+$hasRm   = in_array('-rm', $args);
+$insecureMode = in_array('-insecure', $args);
+
+// 提取 -key 值
+$key = extractValue($args, '-key');
+// 提取 -get 值（位置参数）
+$getCode = extractValue($args, '-get');
+// 提取 -add 参数
+$addUrl  = extractValue($args, '-url');
+$addTtl  = extractValue($args, '-ttl');
+$addCode = extractValue($args, '-code');
+// 提取 -len 参数（服务密钥专用）
+$addLen  = extractValue($args, '-len');
+// 提取 -rm 参数
+$rmCode  = extractValue($args, '-code');
+
+// ── 路由命令 ─────────────────────────────────────────────
+
+if ($hasH) {
+    showHelp();
+    exit(0);
+}
+
+if ($hasV) {
+    echo "nurl-key v" . NURL_KEY_VERSION . "\n";
+    exit(0);
+}
+
+// 只有网络操作需要有效域名；帮助和版本查询应始终可用。
+foreach (['-key', '-get', '-url', '-ttl', '-code', '-len'] as $flag) {
+    if (in_array($flag, $args, true) && extractValue($args, $flag) === null) {
+        fwrite(STDERR, "错误：{$flag} 缺少参数值。\n");
+        exit(1);
+    }
+}
+if (strpos($domain, '{') !== false) {
+    fwrite(STDERR, "错误：config.php 的 domain 尚未配置（仍含占位符），请先修改。\n");
+    exit(1);
+}
+
+// 所有操作都需要 Key
+if (!$key) {
+    fwrite(STDERR, "错误：缺少密钥。请使用 -key \"su_xxx\" 指定 API Key。\n");
+    exit(1);
+}
+
+if ($hasList) {
+    doList($domain, $key, $insecureMode);
+} elseif ($hasStat) {
+    doStat($domain, $key, $insecureMode);
+} elseif ($hasGet && $getCode) {
+    doGet($domain, $key, $getCode, $insecureMode);
+} elseif ($hasAdd) {
+    doAdd($domain, $key, $addUrl, $addTtl, $addCode, $addLen, $insecureMode);
+} elseif ($hasRm && $rmCode) {
+    doRm($domain, $key, $rmCode, $insecureMode);
+} else {
+    echo "未知命令。使用 -h 查看帮助。\n";
+    exit(1);
+}
+
+// ── 函数 ─────────────────────────────────────────────────
+
+function showHelp(): void
+{
+    echo <<<HELP
+nurl-key — Short_NURL 远程短链管理工具 v2.0
+
+用法：php cli/nurl-key -key "su_xxx" <操作> [参数]
+
+操作：
+  -list                    查看所有短链
+  -stat                    查看配额状态
+  -get "code"              查看单条短链
+  -add -url "https://..." -ttl 0 [-code "abc"]
+                           创建短链（-code 可选，不填自动生成）
+  -rm -code "abc"          删除短链
+  -h / -help               显示帮助信息
+  -v                       查看版本
+
+选项：
+  -insecure                跳过 SSL 证书验证（仅用于测试环境）
+  -len 4|5                 服务密钥生成的短码长度
+  参数支持 -flag value 和 -flag:value 两种写法。
+
+所有操作通过无头 API（headless）远程执行，需要网络连接。
+本地管理请使用：php cli/nurl
+HELP;
+}
+
+function extractValue(array $args, string $flag): ?string
+{
+    foreach ($args as $index => $arg) {
+        if (str_starts_with($arg, $flag . ':')) return substr($arg, strlen($flag) + 1);
+        if ($arg === $flag && isset($args[$index + 1])) {
+            $next = $args[$index + 1];
+            if (!preg_match('/^-[a-z]/i', $next)) return $next;
+            return null;
+        }
+    }
+    return null;
+}
+
+function apiRequest(string $domain, string $key, string $method, string $path, ?array $body = null, bool $insecure = false): ?array
+{
+    $url = $domain . $path;
+
+    $ch = curl_init($url);
+    if ($ch === false) {
+        fwrite(STDERR, "错误：cURL 初始化失败\n");
+        return null;
+    }
+
+    $headers = [
+        'X-Headless-Token: ' . $key,
+        'Content-Type: application/json',
+    ];
+
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_HTTPHEADER => $headers,
+    ]);
+
+    if ($method === 'POST' && $body !== null) {
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body));
+    }
+
+    if ($insecure) {
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+    }
+
+    $resp = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+
+    if ($err) {
+        fwrite(STDERR, "错误：cURL 错误：{$err}\n");
+        return null;
+    }
+
+    $data = json_decode($resp, true);
+    if (!is_array($data)) {
+        fwrite(STDERR, "错误：响应解析失败 (HTTP {$code})\n");
+        return null;
+    }
+
+    if ($code >= 400) {
+        $errorMsg = $data['message'] ?? $data['error'] ?? '未知错误';
+        fwrite(STDERR, "错误：{$errorMsg} (HTTP {$code})\n");
+        return null;
+    }
+
+    return $data;
+}
+
+function doList(string $domain, string $key, bool $insecure): void
+{
+    $result = apiRequest($domain, $key, 'GET', '/headless/api/list', null, $insecure);
+    if ($result === null) exit(1);
+
+    // v1.11.0 及 v2 的分组结构：{permanent: [...], temporary: [...]}
+    // 同时兼容 v2 beta 早期版本的扁平数组响应
+    if (isset($result['permanent']) || isset($result['temporary'])) {
+        $permanent = is_array($result['permanent'] ?? null) ? $result['permanent'] : [];
+        $temporary = is_array($result['temporary'] ?? null) ? $result['temporary'] : [];
+    } else {
+        $permanent = [];
+        $temporary = [];
+        foreach ($result as $item) {
+            if (!is_array($item)) continue;
+            if (($item['exp'] ?? null) === 'permanent') {
+                $permanent[] = $item;
+            } else {
+                $temporary[] = $item;
+            }
+        }
+    }
+
+    echo "短链列表\n";
+    echo str_repeat('─', 60) . "\n\n";
+
+    echo "永久短链（" . count($permanent) . " 条）：\n";
+    if (empty($permanent)) {
+        echo "  （空）\n";
+    } else {
+        foreach ($permanent as $i => $item) {
+            $code = $item['id'] ?? '-';
+            $url = $item['url'] ?? '-';
+            echo "  " . ($i + 1) . ". {$code}  →  {$url}\n";
+            echo "     " . ($item['lurl'] ?? '-') . "\n";
+        }
+    }
+    echo "\n";
+
+    echo "临时短链（" . count($temporary) . " 条）：\n";
+    if (empty($temporary)) {
+        echo "  （空）\n";
+    } else {
+        foreach ($temporary as $i => $item) {
+            $code = $item['id'] ?? '-';
+            $url = $item['url'] ?? '-';
+            echo "  " . ($i + 1) . ". {$code}  →  {$url}\n";
+            echo "     " . ($item['lurl'] ?? '-') . "\n";
+            $exp = $item['exp'] ?? '';
+            echo "     过期：" . ($exp !== '' ? $exp : '未知') . "\n";
+        }
+    }
+    echo "\n";
+}
+
+function doStat(string $domain, string $key, bool $insecure): void
+{
+    $result = apiRequest($domain, $key, 'GET', '/headless/api/stat', null, $insecure);
+    if ($result === null) exit(1);
+
+    echo "配额状态：\n";
+    echo "────────────────────────────────────────\n";
+    echo "永久短链：{$result['perm_count']}/{$result['perm_limit']}\n";
+    echo "临时短链：{$result['temp_count']}/{$result['temp_limit']}\n";
+    if (isset($result['hot_perm_count'])) {
+        echo "────────────────────────────────────────\n";
+        echo "热存储（诊断）：\n";
+        echo "  永久：{$result['hot_perm_count']}\n";
+        echo "  临时：{$result['hot_temp_count']}\n";
+    }
+}
+
+function doGet(string $domain, string $key, string $code, bool $insecure): void
+{
+    $result = apiRequest($domain, $key, 'GET', '/headless/api/get/' . urlencode($code), null, $insecure);
+    if ($result === null) exit(1);
+
+    echo "短链信息：\n";
+    echo "────────────────────────────────────────\n";
+    echo "短码：{$result['id']}\n";
+    echo "目标：{$result['url']}\n";
+    echo "短链：{$result['lurl']}\n";
+    echo "过期：{$result['exp']}\n";
+}
+
+function doAdd(string $domain, string $key, ?string $url, ?string $ttl, ?string $code, ?string $len, bool $insecure): void
+{
+    if (!$url) {
+        fwrite(STDERR, "错误：缺少 -url 参数。\n");
+        exit(1);
+    }
+
+    if ($ttl !== null && (!ctype_digit($ttl) || strlen(ltrim($ttl, '0')) > strlen((string)PHP_INT_MAX)
+        || (strlen(ltrim($ttl, '0')) === strlen((string)PHP_INT_MAX) && strcmp(ltrim($ttl, '0'), (string)PHP_INT_MAX) > 0))) {
+        fwrite(STDERR, "错误：-ttl 必须为可表示的非负整数。\n");
+        exit(1);
+    }
+    if ($len !== null && !in_array($len, ['4', '5'], true)) {
+        fwrite(STDERR, "错误：-len 必须为 4 或 5。\n");
+        exit(1);
+    }
+    $body = [
+        'url' => $url,
+        'ttl' => $ttl !== null ? intval($ttl) : 0,
+    ];
+
+    if ($code) {
+        $body['code'] = $code;
+    }
+
+    if ($len) {
+        $body['len'] = intval($len);
+    }
+
+    $result = apiRequest($domain, $key, 'POST', '/headless/api/create', $body, $insecure);
+    if ($result === null) exit(1);
+
+    echo "短链创建成功：\n";
+    echo "────────────────────────────────────────\n";
+    echo "短链：{$result['short_url']}\n";
+    $expires = $result['exp'] ?? '永久';
+    echo "过期：{$expires}\n";
+    if (!empty($result['dedup'])) {
+        echo "（已存在相同目标的短链，返回已有短码）\n";
+    }
+    if (($result['synced'] ?? true) === false) {
+        fwrite(STDERR, "警告：" . ($result['warning'] ?? '短链已保存，但未确认热存储同步，可能暂时无法访问') . "\n");
+    }
+    if (($result['key_consumed'] ?? false) === true) {
+        echo "注：本次请求已消费一次性 Key，该 Key 不可再次使用。\n";
+    }
+}
+
+function doRm(string $domain, string $key, string $code, bool $insecure): void
+{
+    $result = apiRequest($domain, $key, 'POST', '/headless/api/delete', ['code' => $code], $insecure);
+    if ($result === null) exit(1);
+
+    echo "短链已删除：{$code}\n";
+    if (($result['synced'] ?? true) === false) {
+        fwrite(STDERR, "警告：" . ($result['warning'] ?? '冷记录已删除，但热存储未确认同步，原短链可能仍可访问') . "\n");
+    }
+}
